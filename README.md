@@ -11,6 +11,10 @@
 - **整组批准**：多设备可携带同一预期修订号与**非空、无重复**的申请 ID 列表一次性
   申请；锁内同时核对“当前有效许可”与“组内两两”干扰，任一项失败**整组不批准、
   修订号不变**；全部通过时按输入顺序为每项写入批准事件与连续修订号，一次提交
+- **可用调频位置查询**：为待审批申请在候选频段下界闭区间内寻找可用位置——覆盖圆、
+  UTC 时段与原频段宽度固定（允许单频点），按当前修订快照的有效许可与生效保护带宽
+  裁决，返回全部极大的可用连续范围并标明两端是否可取；查询不改任何状态，结果与
+  单笔预览在任一可取下界上的干扰结论一致
 - 撤销只改变后续裁决所用的**有效集合**；按修订号查询可还原当时全部批准、撤销记录
   （整组中的每个修订号都可单独还原截至该项获批时的有效集合）
 - **保护带宽在线调整**：`GUARD_BAND` 环境变量仅作全新数据库的初值；之后通过
@@ -66,7 +70,7 @@ export GUARD_BAND="2.0"
 uvicorn app.main:app --reload
 ```
 
-运行测试（自动使用临时 SQLite 库，共 62 个用例）：
+运行测试（自动使用临时 SQLite 库，共 83 个用例）：
 
 ```bash
 pip install -r requirements-dev.txt
@@ -126,6 +130,25 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
      （间隔**恰好等于**保护带宽时允许，即“严格小于”）。
 
 裁决只考虑**有效集合**：已批准且未被撤销的申请。待审批、已撤销均不参与。
+
+### 可用调频位置查询（不改状态）
+
+`POST /api/applications/{id}/available-ranges` 为**待审批**申请寻找可用调频位置：
+覆盖圆、UTC 时段与原**频段宽度** `w = high - low` 固定（`w = 0` 的单频点允许），
+仅让频段**下界** `x` 在请求体的闭区间 `[candidate_low_min, candidate_low_max]`
+内变动（两端相等即查询单个候选位置）。裁决与 `preview` 使用**同一修订快照**的
+有效许可与当前生效保护带宽：只有空间与时间均相交的许可才会阻断；对这样的许可
+`[L0, L1]`，下界 `x` 的禁区恰为 `(L0 - w - g, L1 + g)`——端点相碰算干扰、分离间隔
+**严格小于** `g` 算干扰，故 `g > 0` 时禁区为开区间（间隔恰等于 `g` 可取），
+`g = 0` 时为闭区间（相碰的端点本身不可取）。
+
+响应返回当前修订号、保护带宽、固定带宽 `bandwidth`，以及候选下界区间内**全部
+极大的可用连续范围**（升序），每段用 `min_inclusive` / `max_inclusive` 标明两端
+是否可取（可能退化为单个可取点）；无可用位置时 `available_ranges` 为空列表。
+把申请频段平移到任一可取下界 `x`（即 `[x, x + bandwidth]`）再做单笔预览，干扰
+结论必然为空。查询**不保存或改动**申请、许可与修订号。未知 ID（404）、非待审批
+申请（409）、非有限或倒置的候选区间（422，明细码 `value_not_finite` /
+`candidate_low_min_above_max`）均明确拒绝。
 
 ### 修订号与并发模型
 
@@ -189,6 +212,7 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 | `GET` | `/api/applications?status=pending` | 列表（可选状态过滤） |
 | `GET` | `/api/applications/{id}` | 查看单笔申请 |
 | `POST` | `/api/applications/{id}/preview` | 冲突预览（返回冲突对象、触发条件、当前修订号） |
+| `POST` | `/api/applications/{id}/available-ranges` | **可用调频位置查询**（候选下界区间内全部极大可用连续范围；不改状态） |
 | `POST` | `/api/applications/{id}/approve` | 携带修订号批准（锁内重新裁决） |
 | `POST` | `/api/applications/batch-approve` | **整组原子批准**（预期修订号 + 非空无重复 ID 列表） |
 | `POST` | `/api/applications/{id}/revoke` | 撤销（仅影响后续有效集合） |
@@ -207,10 +231,10 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 
 | HTTP | `error.code` | 触发场景 |
 | --- | --- | --- |
-| 422 | `validation_failed` | 提交/参数校验失败（整笔拒收，`details` 为全部违例）；整组列表为空或含重复 ID 时同样 422，明细码为 `duplicate_application_id`；拟定带宽非有限数（`value_not_finite`）或为负（`guard_band_negative`） |
+| 422 | `validation_failed` | 提交/参数校验失败（整笔拒收，`details` 为全部违例）；整组列表为空或含重复 ID 时同样 422，明细码为 `duplicate_application_id`；拟定带宽非有限数（`value_not_finite`）或为负（`guard_band_negative`）；候选下界区间非有限（`value_not_finite`）或倒置（`candidate_low_min_above_max`） |
 | 404 | `not_found` | 申请不存在（整组时 `details.missing_application_ids` 列出全部无效 ID） |
 | 404 | `revision_out_of_range` | 查询了未来修订号 |
-| 409 | `not_pending` | 批准已处理申请 / 撤销待审批申请（整组时 `details.applications` 列出每项状态） |
+| 409 | `not_pending` | 批准已处理申请 / 撤销待审批申请 / 对非待审批申请查询可用位置（整组时 `details.applications` 列出每项状态） |
 | 409 | `already_revoked` | 重复撤销（整组中混入已撤销申请时同样返回，明细同 `not_pending` 结构） |
 | 409 | `stale_revision` | 修订号过期或被并发批准抢占（单笔/整组/撤销/带宽变更共享裁决） |
 | 409 | `interference` | 重新裁决发现干扰，频段未占用（整组时 `details.applications[].conflicts` 用 `scope` 区分 `effective`/`group`）；或拟定带宽会使当前有效许可对互扰，带宽未变更（`details.interfering_pairs` 附许可对与触发条件） |
@@ -558,6 +582,59 @@ curl -i -X POST http://localhost:8000/api/config/guard-band \
 #                "message": "guard_band must be non-negative"}]}}
 ```
 
+### 6.15 可用调频位置查询（不改状态）
+
+设保护带宽为 **2 MHz**、修订号为 1，有效集合中有许可 A `[110,120]`；申请 B
+（待审批）频段为 `[100,105]`（宽度 5 MHz），与 A 同时段、覆盖区域相交。运营人员
+想在候选下界区间 `[90, 130]` 内为 B 寻找可用位置：
+
+```bash
+curl -s -X POST http://localhost:8000/api/applications/2/available-ranges \
+  -H 'Content-Type: application/json' \
+  -d '{"candidate_low_min": 90, "candidate_low_max": 130}'
+```
+
+```json
+{"application_id": 2, "current_revision": 1, "guard_band": 2.0, "bandwidth": 5.0,
+ "candidate_low_min": 90.0, "candidate_low_max": 130.0,
+ "available_ranges": [
+   {"min": 90.0,  "max": 103.0, "min_inclusive": true, "max_inclusive": true},
+   {"min": 122.0, "max": 130.0, "min_inclusive": true, "max_inclusive": true}
+ ]}
+```
+
+A 的频段 `[110,120]` 对下界 `x` 的禁区是 `(110-5-2, 120+2) = (103, 122)`：间隔
+**恰好等于**保护带宽 2 允许（端点 `103`、`122` 均可取，`max_inclusive` /
+`min_inclusive` 为 `true`）。把 B 的频段平移到任一可取下界（如 `[103,108]`，
+与 A 间隔恰为 2）再预览，`has_conflicts` 必为 `false`；平移到禁区内
+（如 `[110,115]`）必为 `true`。
+
+若保护带宽为 **0**，同一查询的两段端点变为不可取（端点相碰算干扰）：
+
+```json
+"available_ranges": [
+  {"min": 90.0,  "max": 105.0, "min_inclusive": true,  "max_inclusive": false},
+  {"min": 120.0, "max": 130.0, "min_inclusive": false, "max_inclusive": true}
+]
+```
+
+无可用位置时返回空列表；查询不产生任何修订号、不改变申请状态：
+
+```bash
+curl -s -X POST http://localhost:8000/api/applications/2/available-ranges \
+  -H 'Content-Type: application/json' \
+  -d '{"candidate_low_min": 111, "candidate_low_max": 119}'
+# {"application_id": 2, ..., "available_ranges": []}
+
+# 倒置区间 / 非有限值 -> 422；未知 ID -> 404；非待审批申请 -> 409
+curl -i -X POST http://localhost:8000/api/applications/2/available-ranges \
+  -H 'Content-Type: application/json' \
+  -d '{"candidate_low_min": 130, "candidate_low_max": 90}'
+# HTTP/1.1 422 {"error": {"code": "validation_failed",
+#   "details": [{"field": "candidate_low_min",
+#                "code": "candidate_low_min_above_max", ...}]}}
+```
+
 脚本版走查：[`examples/walkthrough.sh`](examples/walkthrough.sh)
 （`./examples/walkthrough.sh http://localhost:8000`）。
 
@@ -568,10 +645,10 @@ curl -i -X POST http://localhost:8000/api/config/guard-band \
 ```
 .
 ├── app/
-│   ├── main.py                 # FastAPI 路由、序列化、并发/快照逻辑（含整组批准与带宽在线配置）
-│   ├── adjudication.py         # 纯函数：圆/时段/频段/保护带宽裁决（含组内两两与有效集成对检查）
-│   ├── semantic_validation.py  # 整笔拒收的跨字段语义校验（含拟定带宽校验）
-│   ├── schemas.py              # Pydantic 请求模型（含 BatchApprovalRequest、GuardBand*Request）
+│   ├── main.py                 # FastAPI 路由、序列化、并发/快照逻辑（含整组批准、带宽在线配置与可用位置查询）
+│   ├── adjudication.py         # 纯函数：圆/时段/频段/保护带宽裁决（含组内两两、有效集成对检查与可用下界区间求解）
+│   ├── semantic_validation.py  # 整笔拒收的跨字段语义校验（含拟定带宽与候选下界区间校验）
+│   ├── schemas.py              # Pydantic 请求模型（含 BatchApprovalRequest、GuardBand*Request、AvailableRangesRequest）
 │   ├── models.py               # SQLAlchemy 表（申请 + 批准/撤销/带宽事件 + 修订号/当前带宽）
 │   ├── db.py                   # 引擎、等待数据库、建表、修订号与带宽初值初始化（重启不覆盖）
 │   ├── config.py               # 环境变量配置（GUARD_BAND 仅作建库初值）

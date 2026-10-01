@@ -6,6 +6,8 @@ POST   /api/applications                 submit (whole-request validation)
 GET    /api/applications                 list submissions
 GET    /api/applications/{id}            fetch one submission
 POST   /api/applications/{id}/preview    conflicts + current revision
+POST   /api/applications/{id}/available-ranges
+                                       maximal free lower-bound ranges
 POST   /api/applications/{id}/approve    conditional approval (expected rev.)
 POST   /api/applications/batch-approve   atomic group approval (expected rev.)
 POST   /api/applications/{id}/revoke     revoke (changes future effective set)
@@ -63,12 +65,17 @@ from .models import (
 from .schemas import (
     ApplicationCreate,
     ApprovalRequest,
+    AvailableRangesRequest,
     BatchApprovalRequest,
     GuardBandPreviewRequest,
     GuardBandUpdateRequest,
     RevocationRequest,
 )
-from .semantic_validation import validate_application, validate_guard_band
+from .semantic_validation import (
+    validate_application,
+    validate_candidate_low_range,
+    validate_guard_band,
+)
 
 log = logging.getLogger("radio.api")
 
@@ -506,6 +513,87 @@ def preview_application(application_id: int) -> dict[str, Any]:
         "guard_band": guard_band,
         "has_conflicts": bool(conflicts),
         "conflicts": [serialize_conflict(c, guard_band) for c in conflicts],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Available ranges (non-mutating search over candidate band lower bounds)
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/api/applications/{application_id}/available-ranges",
+    tags=["applications"],
+)
+def find_available_ranges(
+    application_id: int, payload: AvailableRangesRequest
+) -> dict[str, Any]:
+    """Every maximal interference-free range of candidate band lower bounds.
+
+    The application keeps its coverage circle, UTC time window and band
+    *width* (possibly zero for a single frequency); only the lower bound of
+    its band varies over the closed candidate interval
+    ``[candidate_low_min, candidate_low_max]``.  Adjudication uses the
+    effective licenses and the live guard band of the current revision,
+    exactly like ``preview``: only grants intersecting in space and time
+    block, touching band endpoints interfere, and a separation strictly
+    smaller than the guard band interferes.  Each returned range flags
+    whether its endpoints are attainable; the list is empty when no
+    candidate lower bound is usable.  The query never mutates applications,
+    licenses or the revision.
+    """
+    errors = validate_candidate_low_range(payload)
+    if errors:
+        raise APIError(
+            E_VALIDATION,
+            "the available-ranges query was rejected due to invalid fields",
+            status_code=422,
+            details=errors,
+        )
+    with SessionLocal() as session:
+        row = session.get(Application, application_id)
+        if row is None:
+            raise APIError(
+                E_NOT_FOUND,
+                f"application {application_id} does not exist",
+                status_code=404,
+            )
+        if row.status != "pending":
+            raise APIError(
+                E_NOT_PENDING,
+                f"application {application_id} is {row.status}, only pending "
+                "applications can be searched for available ranges",
+                status_code=409,
+                details={"status": row.status},
+            )
+
+        meta = session.get(RevisionMeta, 1)
+        current = meta.revision
+        guard_band = meta.guard_band
+        bandwidth = row.freq_high - row.freq_low
+        effective = load_effective_licenses(session)
+        ranges = adjudication.available_ranges(
+            to_license(row),
+            effective,
+            guard_band,
+            payload.candidate_low_min,
+            payload.candidate_low_max,
+        )
+
+    return {
+        "application_id": application_id,
+        "current_revision": current,
+        "guard_band": guard_band,
+        "bandwidth": bandwidth,
+        "candidate_low_min": payload.candidate_low_min,
+        "candidate_low_max": payload.candidate_low_max,
+        "available_ranges": [
+            {
+                "min": r.min,
+                "max": r.max,
+                "min_inclusive": r.min_inclusive,
+                "max_inclusive": r.max_inclusive,
+            }
+            for r in ranges
+        ],
     }
 
 

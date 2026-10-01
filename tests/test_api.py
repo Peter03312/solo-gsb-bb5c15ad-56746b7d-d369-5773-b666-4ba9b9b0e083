@@ -529,6 +529,201 @@ class TestBatchApprove:
         assert client.get(f"/api/applications/{b}").json()["status"] == "pending"
 
 
+class TestAvailableRanges:
+    """POST /api/applications/{id}/available-ranges (non-mutating search)."""
+
+    def _submit(self, client, name, **kw):
+        return client.post(
+            "/api/applications", json=body(name=name, **kw)
+        ).json()["id"]
+
+    def _approve(self, client, app_id, expected):
+        r = client.post(
+            f"/api/applications/{app_id}/approve",
+            json={"expected_revision": expected},
+        )
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    def _query(self, client, app_id, lo, hi):
+        return client.post(
+            f"/api/applications/{app_id}/available-ranges",
+            json={"candidate_low_min": lo, "candidate_low_max": hi},
+        )
+
+    def test_ranges_split_by_blocking_grant(self, client):
+        a = self._submit(client, "A", freq=(110, 120))
+        self._approve(client, a, 0)
+        b = self._submit(client, "B", freq=(100, 105))  # width 5
+
+        r = self._query(client, b, 90, 130)
+        assert r.status_code == 200, r.text
+        body_ = r.json()
+        assert body_["application_id"] == b
+        assert body_["current_revision"] == 1
+        assert body_["guard_band"] == 2.0
+        assert body_["bandwidth"] == 5.0
+        assert body_["candidate_low_min"] == 90
+        assert body_["candidate_low_max"] == 130
+        # grant [110,120] forbids lower bounds (103,122); gap == guard is ok
+        assert body_["available_ranges"] == [
+            {"min": 90, "max": 103, "min_inclusive": True, "max_inclusive": True},
+            {"min": 122, "max": 130, "min_inclusive": True, "max_inclusive": True},
+        ]
+
+    def test_only_space_and_time_intersecting_grants_block(self, client):
+        far = self._submit(client, "far", circle=(1000, 1000, 5), freq=(110, 120))
+        later = self._submit(
+            client,
+            "later",
+            freq=(110, 120),
+            start="2026-10-01T10:00:00Z",  # == default end, half-open: no overlap
+            end="2026-10-01T12:00:00Z",
+        )
+        self._approve(client, far, 0)
+        self._approve(client, later, 1)
+        b = self._submit(client, "B", freq=(100, 105))
+
+        body_ = self._query(client, b, 90, 130).json()
+        assert body_["available_ranges"] == [
+            {"min": 90, "max": 130, "min_inclusive": True, "max_inclusive": True}
+        ]
+
+    def test_empty_when_fully_covered(self, client):
+        a = self._submit(client, "A", freq=(110, 120))
+        self._approve(client, a, 0)
+        b = self._submit(client, "B", freq=(100, 100))
+        body_ = self._query(client, b, 111, 119).json()
+        assert body_["available_ranges"] == []
+
+    def test_zero_guard_band_excludes_touching_endpoints(self, client):
+        r = client.post(
+            "/api/config/guard-band",
+            json={"guard_band": 0.0, "expected_revision": 0},
+        )
+        assert r.status_code == 200
+        a = self._submit(client, "A", freq=(110, 120))
+        self._approve(client, a, 1)
+        b = self._submit(client, "B", freq=(100, 105))
+
+        body_ = self._query(client, b, 90, 130).json()
+        assert body_["guard_band"] == 0.0
+        # touching bands interfere: 105 and 120 themselves are not attainable
+        assert body_["available_ranges"] == [
+            {"min": 90, "max": 105, "min_inclusive": True, "max_inclusive": False},
+            {"min": 120, "max": 130, "min_inclusive": False, "max_inclusive": True},
+        ]
+
+    def test_single_frequency_application(self, client):
+        a = self._submit(client, "A", freq=(110, 120))
+        self._approve(client, a, 0)
+        b = self._submit(client, "B", freq=(100, 100))  # single frequency
+        body_ = self._query(client, b, 100, 130).json()
+        assert body_["bandwidth"] == 0.0
+        assert body_["available_ranges"] == [
+            {"min": 100, "max": 108, "min_inclusive": True, "max_inclusive": True},
+            {"min": 122, "max": 130, "min_inclusive": True, "max_inclusive": True},
+        ]
+
+    def test_query_is_non_mutating(self, client):
+        a = self._submit(client, "A", freq=(110, 120))
+        self._approve(client, a, 0)
+        b = self._submit(client, "B", freq=(100, 105))
+        before = client.get(f"/api/applications/{b}").json()
+
+        self._query(client, b, 90, 130).raise_for_status()
+        self._query(client, b, 90, 130).raise_for_status()
+
+        assert client.get(f"/api/applications/{b}").json() == before
+        current = client.get("/api/revision/current").json()
+        assert current["current_revision"] == 1
+        assert current["effective_application_ids"] == [a]
+
+    def test_consistent_with_preview_at_reported_bounds(self, client):
+        a = self._submit(client, "A", freq=(110, 120))
+        self._approve(client, a, 0)
+        b = self._submit(client, "B", freq=(100, 105))
+        app_b = client.get(f"/api/applications/{b}").json()
+        body_ = self._query(client, b, 90, 130).json()
+
+        # every reported inclusive endpoint previews conflict-free when the
+        # band of B is shifted there; a forbidden midpoint does not
+        points = []
+        for r in body_["available_ranges"]:
+            if r["min_inclusive"]:
+                points.append((r["min"], False))
+            if r["max_inclusive"]:
+                points.append((r["max"], False))
+        points.append((110, True))  # inside the forbidden zone
+        for low, expect_conflict in points:
+            shifted = client.post(
+                "/api/applications",
+                json=body(
+                    name=f"shifted-{low}",
+                    freq=(low, low + body_["bandwidth"]),
+                ),
+            ).json()
+            prev = client.post(
+                f"/api/applications/{shifted['id']}/preview"
+            ).json()
+            assert prev["has_conflicts"] is expect_conflict, (low, prev)
+        # the original application is untouched by all of this
+        assert client.get(f"/api/applications/{b}").json() == app_b
+
+    def test_unknown_application_rejected(self, client):
+        r = self._query(client, 999, 90, 130)
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "not_found"
+
+    def test_non_pending_rejected(self, client):
+        a = self._submit(client, "A")
+        self._approve(client, a, 0)
+        r = self._query(client, a, 90, 130)
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "not_pending"
+        assert r.json()["error"]["details"] == {"status": "approved"}
+
+        client.post(f"/api/applications/{a}/revoke", json={}).raise_for_status()
+        r2 = self._query(client, a, 90, 130)
+        assert r2.status_code == 409
+        assert r2.json()["error"]["code"] == "not_pending"
+
+    def test_inverted_candidate_interval_rejected(self, client):
+        b = self._submit(client, "B")
+        r = self._query(client, b, 130, 90)
+        assert r.status_code == 422
+        err = r.json()["error"]
+        assert err["code"] == "validation_failed"
+        codes = [d["code"] for d in err["details"]]
+        assert codes == ["candidate_low_min_above_max"]
+        # equal bounds are allowed (a single candidate position)
+        ok = self._query(client, b, 100, 100)
+        assert ok.status_code == 200
+        assert ok.json()["available_ranges"] == [
+            {"min": 100, "max": 100, "min_inclusive": True, "max_inclusive": True}
+        ]
+
+    def test_non_finite_candidate_interval_rejected(self, client):
+        b = self._submit(client, "B")
+        for raw in (
+            '{"candidate_low_min": NaN, "candidate_low_max": 130}',
+            '{"candidate_low_min": 90, "candidate_low_max": Infinity}',
+            '{"candidate_low_min": -Infinity, "candidate_low_max": 130}',
+        ):
+            r = client.post(
+                f"/api/applications/{b}/available-ranges",
+                content=raw,
+                headers={"Content-Type": "application/json"},
+            )
+            assert r.status_code == 422, raw
+            err = r.json()["error"]
+            assert err["code"] == "validation_failed"
+            codes = [d["code"] for d in err["details"]]
+            assert codes == ["value_not_finite"]
+        # nothing consumed by the rejections
+        assert client.get("/api/revision/current").json()["current_revision"] == 0
+
+
 class TestGuardBandConfig:
     """Online guard-band configuration: preview, confirm, history."""
 

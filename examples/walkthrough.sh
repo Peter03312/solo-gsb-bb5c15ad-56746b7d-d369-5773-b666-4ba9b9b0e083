@@ -123,3 +123,35 @@ curl -s "$BASE/api/revision/7" | python3 -c 'import json,sys; d=json.load(sys.st
 echo "    approval events keep the band they were decided under (not rewritten):"
 curl -s "$BASE/api/revision/7" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("approval guard_bands =", [(a["revision"], a["guard_band"]) for a in d["approvals"]])'
 curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("current_revision =", d["current_revision"], "guard_band =", d["guard_band"])'
+
+echo "== 23. available-ranges search for pending device F (band [500,510], width 10) =="
+echo "    effective grants in its 13:00-18:00 window: C [200,210], D [300,310], E [400,410]; guard band is now 1.0"
+post "/api/applications/$F_ID/available-ranges" \
+  '{"candidate_low_min":180,"candidate_low_max":430}' | J
+echo "    forbidden by C: (200-10-1, 210+1) = (189,211); by D: (289,311); by E: (389,411)"
+echo "    -> free lower bounds: [180,189], [211,289], [311,389], [411,430] (endpoints attainable)"
+
+echo "== 24. a reported endpoint previews conflict-free; a forbidden point does not =="
+SHIFTED=$(post /api/applications "{
+  \"name\":\"F shifted to 211\",
+  \"circle\":{\"cx\":0,\"cy\":0,\"radius\":1000},
+  \"frequency\":{\"low\":211,\"high\":221},
+  \"time_window\":{\"start\":\"2026-10-01T13:00:00Z\",\"end\":\"2026-10-01T18:00:00Z\"}
+}")
+SHIFTED_ID=$(echo "$SHIFTED" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+post "/api/applications/$SHIFTED_ID/preview" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("shifted to 211 (gap == guard): has_conflicts =", d["has_conflicts"])'
+CLASH=$(post /api/applications "{
+  \"name\":\"F shifted to 200\",
+  \"circle\":{\"cx\":0,\"cy\":0,\"radius\":1000},
+  \"frequency\":{\"low\":200,\"high\":210},
+  \"time_window\":{\"start\":\"2026-10-01T13:00:00Z\",\"end\":\"2026-10-01T18:00:00Z\"}
+}")
+CLASH_ID=$(echo "$CLASH" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+post "/api/applications/$CLASH_ID/preview" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("shifted to 200 (inside forbidden): has_conflicts =", d["has_conflicts"])'
+
+echo "== 25. the search is non-mutating and validates its inputs =="
+post "/api/applications/$F_ID/available-ranges" \
+  '{"candidate_low_min":430,"candidate_low_max":180}' | J || true
+post "/api/applications/999999/available-ranges" \
+  '{"candidate_low_min":180,"candidate_low_max":430}' | J || true
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("current_revision is still", d["current_revision"])'

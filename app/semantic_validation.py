@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import math
 
-from .schemas import ApplicationCreate
+from .schemas import ApplicationCreate, AvailableRangesRequest
 
 RADIUS_NOT_POSITIVE = "radius_not_positive"
 FREQUENCY_LOW_ABOVE_HIGH = "frequency_low_above_high"
@@ -15,6 +15,7 @@ TIME_START_NOT_BEFORE_END = "time_start_not_before_end"
 VALUE_NOT_FINITE = "value_not_finite"
 NAIVE_DATETIME = "naive_datetime"
 GUARD_BAND_NEGATIVE = "guard_band_negative"
+CANDIDATE_LOW_MIN_ABOVE_MAX = "candidate_low_min_above_max"
 
 
 def validate_application(payload: ApplicationCreate) -> list[dict[str, str]]:
@@ -95,6 +96,40 @@ def validate_guard_band(value: float) -> list[dict[str, str]]:
                 "field": "guard_band",
                 "code": GUARD_BAND_NEGATIVE,
                 "message": "guard_band must be non-negative",
+            }
+        )
+    return errors
+
+
+def validate_candidate_low_range(
+    payload: AvailableRangesRequest,
+) -> list[dict[str, str]]:
+    """Candidate lower-bound interval: finite numbers, min <= max.
+
+    Equal bounds are allowed (a single candidate position); only an
+    inverted interval is rejected.
+    """
+    errors: list[dict[str, str]] = []
+    numbers = {
+        "candidate_low_min": payload.candidate_low_min,
+        "candidate_low_max": payload.candidate_low_max,
+    }
+    for field, value in numbers.items():
+        if not math.isfinite(value):
+            errors.append(
+                {
+                    "field": field,
+                    "code": VALUE_NOT_FINITE,
+                    "message": f"{field} must be a finite number",
+                }
+            )
+
+    if payload.candidate_low_min > payload.candidate_low_max:
+        errors.append(
+            {
+                "field": "candidate_low_min",
+                "code": CANDIDATE_LOW_MIN_ABOVE_MAX,
+                "message": "candidate_low_min must not exceed candidate_low_max",
             }
         )
     return errors

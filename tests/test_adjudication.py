@@ -5,6 +5,7 @@ from app.adjudication import (
     REASON_WITHIN_GUARD_BAND,
     Circle,
     License,
+    available_ranges,
     circles_intersect,
     closed_intervals_intersect,
     evaluate,
@@ -241,3 +242,102 @@ class TestFindInterferingPairs:
         assert find_interfering_pairs(members, 2.0) == []
         (pair,) = find_interfering_pairs(members, 2.5)
         assert pair.minimum_frequency_gap == 2.0
+
+
+def ranges_tuples(ranges):
+    return [(r.min, r.max, r.min_inclusive, r.max_inclusive) for r in ranges]
+
+
+class TestAvailableRanges:
+    def test_single_blocking_grant_splits_the_candidate_interval(self):
+        # candidate width 5, grant [110,120], guard 2 -> forbidden (103,122)
+        ranges = available_ranges(lic(1, flo=100, fhi=105), [lic(9, flo=110, fhi=120)], 2.0, 90, 130)
+        assert ranges_tuples(ranges) == [
+            (90, 103, True, True),  # gap exactly 2 at 103: allowed
+            (122, 130, True, True),  # gap exactly 2 at 122: allowed
+        ]
+
+    def test_zero_guard_band_makes_touching_endpoints_unattainable(self):
+        # guard 0 -> forbidden [105,120] closed, endpoints excluded
+        ranges = available_ranges(lic(1, flo=100, fhi=105), [lic(9, flo=110, fhi=120)], 0.0, 90, 130)
+        assert ranges_tuples(ranges) == [
+            (90, 105, True, False),
+            (120, 130, False, True),
+        ]
+
+    def test_single_frequency_candidate(self):
+        # width 0 (single frequency): forbidden (108,122) under guard 2
+        ranges = available_ranges(lic(1, flo=100, fhi=100), [lic(9, flo=110, fhi=120)], 2.0, 100, 130)
+        assert ranges_tuples(ranges) == [
+            (100, 108, True, True),
+            (122, 130, True, True),
+        ]
+
+    def test_grants_disjoint_in_time_or_area_do_not_block(self):
+        far = lic(9, cx=1000.0, r=1.0)
+        later = lic(10, start=T1, end=T3)
+        ranges = available_ranges(lic(1), [far, later], 2.0, 100, 130)
+        assert ranges_tuples(ranges) == [(100, 130, True, True)]
+
+    def test_overlapping_forbidden_intervals_merge(self):
+        grants = [lic(9, flo=110, fhi=120), lic(10, flo=115, fhi=125)]
+        ranges = available_ranges(lic(1, flo=100, fhi=100), grants, 2.0, 100, 140)
+        assert ranges_tuples(ranges) == [
+            (100, 108, True, True),
+            (127, 140, True, True),
+        ]
+
+    def test_touching_forbidden_intervals_leave_a_single_point(self):
+        # forbidden (108,122) and (122,136): only 122 sits exactly at gap 2
+        # from both grants, a degenerate both-inclusive range.
+        grants = [lic(9, flo=110, fhi=120), lic(10, flo=124, fhi=134)]
+        ranges = available_ranges(lic(1, flo=100, fhi=100), grants, 2.0, 100, 140)
+        assert ranges_tuples(ranges) == [
+            (100, 108, True, True),
+            (122, 122, True, True),
+            (136, 140, True, True),
+        ]
+
+    def test_fully_covered_candidate_interval_returns_empty(self):
+        ranges = available_ranges(lic(1, flo=100, fhi=100), [lic(9, flo=110, fhi=120)], 2.0, 110, 115)
+        assert ranges == []
+
+    def test_degenerate_candidate_interval(self):
+        # a single candidate position, available ...
+        ranges = available_ranges(lic(1, flo=100, fhi=100), [lic(9, flo=110, fhi=120)], 2.0, 100, 100)
+        assert ranges_tuples(ranges) == [(100, 100, True, True)]
+        # ... or forbidden
+        assert available_ranges(lic(1, flo=100, fhi=100), [lic(9, flo=110, fhi=120)], 2.0, 115, 115) == []
+
+    def test_candidate_window_clips_forbidden_interval(self):
+        # forbidden (108,122) extends beyond the window on both sides
+        ranges = available_ranges(lic(1, flo=100, fhi=100), [lic(9, flo=110, fhi=120)], 2.0, 105, 125)
+        assert ranges_tuples(ranges) == [
+            (105, 108, True, True),
+            (122, 125, True, True),
+        ]
+
+    def test_reported_points_match_evaluate_verdicts(self):
+        # For every reported range endpoint and a dense sweep, evaluate()
+        # on the shifted band must agree: attainable <=> conflict-free.
+        grants = [
+            lic(9, flo=110, fhi=120),
+            lic(10, flo=124, fhi=134),
+            lic(11, flo=200, fhi=201, cx=1000.0, r=1.0),  # disjoint area
+        ]
+        candidate = lic(1, flo=0, fhi=5)
+        for guard in (0.0, 2.0):
+            ranges = available_ranges(candidate, grants, guard, 90, 140)
+            points = {90, 140, 103, 107, 122, 129, 136}
+            for r in ranges:
+                points.update({r.min, r.max})
+            for x in sorted(points):
+                shifted = lic(1, flo=x, fhi=x + 5)
+                conflict_free = not evaluate(shifted, grants, guard)
+                attainable = any(
+                    r.min <= x <= r.max
+                    and (x != r.min or r.min_inclusive)
+                    and (x != r.max or r.max_inclusive)
+                    for r in ranges
+                )
+                assert conflict_free == attainable, (guard, x, ranges)
