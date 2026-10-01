@@ -12,6 +12,9 @@ semantic_validation so the whole request is rejected with explicit codes:
 ``BatchApprovalRequest`` additionally requires a non-empty ID list; duplicate
 IDs inside the list are checked in the handler (with the standard envelope),
 not by Pydantic.
+
+``AvailableBandsRequest`` carries the closed window for the retuned lower
+bound; finiteness and the low <= high rule are semantic checks.
 """
 from __future__ import annotations
 
@@ -76,3 +79,12 @@ class GuardBandUpdateRequest(BaseModel):
     # single/batch approvals and revocations.
     guard_band: float
     expected_revision: int = Field(ge=0)
+
+
+class AvailableBandsRequest(BaseModel):
+    # Closed search window for the retuned band's lower bound.  The
+    # application's band width, coverage circle and UTC window stay fixed;
+    # only the lower bound moves.  Finite/non-inverted checks run in
+    # semantic_validation so they use the standard error envelope.
+    low: float
+    high: float

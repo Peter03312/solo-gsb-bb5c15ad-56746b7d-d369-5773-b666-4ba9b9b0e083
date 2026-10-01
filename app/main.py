@@ -6,6 +6,8 @@ POST   /api/applications                 submit (whole-request validation)
 GET    /api/applications                 list submissions
 GET    /api/applications/{id}            fetch one submission
 POST   /api/applications/{id}/preview    conflicts + current revision
+POST   /api/applications/{id}/available-bands
+                                          maximal free ranges for the lower bound
 POST   /api/applications/{id}/approve    conditional approval (expected rev.)
 POST   /api/applications/batch-approve   atomic group approval (expected rev.)
 POST   /api/applications/{id}/revoke     revoke (changes future effective set)
@@ -49,7 +51,13 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 
 from . import adjudication
-from .adjudication import Circle, Conflict, License, PairConflict
+from .adjudication import (
+    AvailableRange,
+    Circle,
+    Conflict,
+    License,
+    PairConflict,
+)
 from .config import settings
 from .db import SessionLocal, engine, init_db, wait_for_database
 from .errors import APIError, api_error_handler
@@ -63,12 +71,17 @@ from .models import (
 from .schemas import (
     ApplicationCreate,
     ApprovalRequest,
+    AvailableBandsRequest,
     BatchApprovalRequest,
     GuardBandPreviewRequest,
     GuardBandUpdateRequest,
     RevocationRequest,
 )
-from .semantic_validation import validate_application, validate_guard_band
+from .semantic_validation import (
+    validate_application,
+    validate_frequency_window,
+    validate_guard_band,
+)
 
 log = logging.getLogger("radio.api")
 
@@ -192,6 +205,18 @@ def serialize_group_conflict(
     body = serialize_conflict(conflict, guard_band)
     body["scope"] = scope
     return body
+
+
+def serialize_available_range(
+    available: AvailableRange,
+) -> dict[str, Any]:
+    """One maximal free run of lower bounds, with per-endpoint inclusivity."""
+    return {
+        "low": available.low,
+        "high": available.high,
+        "low_inclusive": available.low_inclusive,
+        "high_inclusive": available.high_inclusive,
+    }
 
 
 def load_effective_licenses(session) -> list[License]:
@@ -506,6 +531,84 @@ def preview_application(application_id: int) -> dict[str, Any]:
         "guard_band": guard_band,
         "has_conflicts": bool(conflicts),
         "conflicts": [serialize_conflict(c, guard_band) for c in conflicts],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Retuning search (non-mutating): maximal free ranges for the lower bound
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/api/applications/{application_id}/available-bands", tags=["applications"]
+)
+def available_bands(
+    application_id: int, payload: AvailableBandsRequest
+) -> dict[str, Any]:
+    """Find every maximal interference-free run for the retuned lower bound.
+
+    The application keeps its original band width, coverage circle and UTC
+    window; only the closed band's lower bound ``x`` moves inside the
+    requested window ``[payload.low, payload.high]``.  Adjudication uses the
+    same revision snapshot semantics as a single preview: the current
+    revision and live guard band, against currently effective licenses only
+    (pending/revoked grants never block), with a license counted only when
+    its circle and UTC window intersect the application's.  Never mutates
+    state: applications, licenses and the revision number are untouched.
+
+    At every inclusive endpoint returned here, a single-application preview
+    of the application retuned to that exact lower bound reports no
+    interference (and vice versa for exclusive endpoints).
+    """
+    errors = validate_frequency_window(payload.low, payload.high)
+    if errors:
+        raise APIError(
+            E_VALIDATION,
+            "the retuning search was rejected due to an invalid candidate window",
+            status_code=422,
+            details=errors,
+        )
+
+    with SessionLocal() as session:
+        row = session.get(Application, application_id)
+        if row is None:
+            raise APIError(
+                E_NOT_FOUND,
+                f"application {application_id} does not exist",
+                status_code=404,
+            )
+        if row.status != "pending":
+            raise APIError(
+                E_NOT_PENDING,
+                f"application {application_id} is {row.status}, only pending "
+                "applications can be searched for retuning positions",
+                status_code=409,
+                details={"status": row.status},
+            )
+
+        meta = session.get(RevisionMeta, 1)
+        current = meta.revision
+        guard_band = meta.guard_band
+        effective = load_effective_licenses(session)
+        candidate = to_license(row)
+        width = row.freq_high - row.freq_low
+        ranges = adjudication.available_lower_bands(
+            candidate=candidate,
+            width=width,
+            window_low=payload.low,
+            window_high=payload.high,
+            effective=effective,
+            guard_band=guard_band,
+        )
+        serialized = [serialize_available_range(r) for r in ranges]
+
+    return {
+        "application_id": application_id,
+        "current_revision": current,
+        "guard_band": guard_band,
+        "band_width": width,
+        "candidate_window": {"low": payload.low, "high": payload.high},
+        "has_available_ranges": bool(serialized),
+        "available_range_count": len(serialized),
+        "available_ranges": serialized,
     }
 
 

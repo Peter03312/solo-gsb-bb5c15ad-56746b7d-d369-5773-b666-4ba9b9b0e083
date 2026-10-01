@@ -123,3 +123,34 @@ curl -s "$BASE/api/revision/7" | python3 -c 'import json,sys; d=json.load(sys.st
 echo "    approval events keep the band they were decided under (not rewritten):"
 curl -s "$BASE/api/revision/7" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("approval guard_bands =", [(a["revision"], a["guard_band"]) for a in d["approvals"]])'
 curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("current_revision =", d["current_revision"], "guard_band =", d["guard_band"])'
+
+echo "== 23. retuning search for a pending application (read-only) =="
+echo "    effective B is [111,112] MHz at 09:00-11:00, band is now 1.0 MHz;"
+echo "    a pending width-10 application searched over [0,400] is blocked on (100,113)"
+P=$(post /api/applications '{
+  "name":"Retune Me",
+  "circle":{"cx":0,"cy":0,"radius":1000},
+  "frequency":{"low":100,"high":110},
+  "time_window":{"start":"2026-10-01T08:00:00Z","end":"2026-10-01T10:00:00Z"}
+}')
+P_ID=$(echo "$P" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+post "/api/applications/$P_ID/available-bands" '{"low":0,"high":400}' | J
+echo "    endpoints 100 and 113 are inclusive (gap == 1.0 == guard band);"
+echo "    a single preview at lower bound 100 agrees (no conflicts):"
+Q=$(post /api/applications '{
+  "name":"probe at 100",
+  "circle":{"cx":0,"cy":0,"radius":1000},
+  "frequency":{"low":100,"high":110},
+  "time_window":{"start":"2026-10-01T08:00:00Z","end":"2026-10-01T10:00:00Z"}
+}')
+Q_ID=$(echo "$Q" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+post "/api/applications/$Q_ID/preview" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("has_conflicts =", d["has_conflicts"], "current_revision =", d["current_revision"])'
+
+echo "    a fully blocked window returns an empty list:"
+post "/api/applications/$P_ID/available-bands" '{"low":101,"high":112}' \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("has_available_ranges =", d["has_available_ranges"], "ranges =", d["available_ranges"])'
+
+echo "    inverted window -> 422; unknown id -> 404 (nothing is mutated):"
+post "/api/applications/$P_ID/available-bands" '{"low":400,"high":0}' | J || true
+post "/api/applications/999999/available-bands" '{"low":0,"high":1}' | J || true
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print("current_revision still =", json.load(sys.stdin)["current_revision"])'

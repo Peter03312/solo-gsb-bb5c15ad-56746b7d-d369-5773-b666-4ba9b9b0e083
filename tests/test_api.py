@@ -824,3 +824,278 @@ class TestGuardBandConfig:
                 == "pending"
             )
         assert client.get("/api/revision/current").json()["current_revision"] == 1
+
+
+class TestAvailableBands:
+    PATH = "/api/applications/{id}/available-bands"
+
+    def _submit(self, client, name, **kw):
+        return client.post(
+            "/api/applications", json=body(name=name, **kw)
+        ).json()["id"]
+
+    def _approve(self, client, app_id, expected):
+        client.post(
+            f"/api/applications/{app_id}/approve",
+            json={"expected_revision": expected},
+        ).raise_for_status()
+
+    def _search(self, client, app_id, low, high):
+        return client.post(
+            self.PATH.format(id=app_id), json={"low": low, "high": high}
+        )
+
+    def test_basic_ranges_against_one_effective_license(self, client):
+        lic_id = self._submit(client, "L", freq=(200, 210))
+        self._approve(client, lic_id, 0)
+        pid = self._submit(client, "P", freq=(100, 110))  # width 10
+
+        r = self._search(client, pid, 0, 300)
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["application_id"] == pid
+        assert d["current_revision"] == 1
+        assert d["guard_band"] == 2.0
+        assert d["band_width"] == 10.0
+        assert d["candidate_window"] == {"low": 0.0, "high": 300.0}
+        assert d["has_available_ranges"] is True
+        assert d["available_range_count"] == 2
+        # blocked (200-10-2, 210+2) = (188, 212)
+        assert d["available_ranges"] == [
+            {"low": 0.0, "high": 188.0,
+             "low_inclusive": True, "high_inclusive": True},
+            {"low": 212.0, "high": 300.0,
+             "low_inclusive": True, "high_inclusive": True},
+        ]
+
+    def test_empty_list_when_window_fully_blocked(self, client):
+        lic_id = self._submit(client, "L", freq=(100, 110))
+        self._approve(client, lic_id, 0)
+        pid = self._submit(client, "P", freq=(100, 110))
+
+        r = self._search(client, pid, 100, 105)
+        assert r.status_code == 200
+        d = r.json()
+        assert d["available_ranges"] == []
+        assert d["has_available_ranges"] is False
+        assert d["available_range_count"] == 0
+
+    def test_single_frequency_application_is_allowed(self, client):
+        # width 0 pending application; guard 2 around a point license
+        lic_id = self._submit(client, "L", freq=(100, 100))
+        self._approve(client, lic_id, 0)
+        pid = self._submit(client, "P", freq=(50, 50))
+        r = self._search(client, pid, 0, 200)
+        assert r.status_code == 200
+        assert r.json()["available_ranges"] == [
+            {"low": 0.0, "high": 98.0,
+             "low_inclusive": True, "high_inclusive": True},
+            {"low": 102.0, "high": 200.0,
+             "low_inclusive": True, "high_inclusive": True},
+        ]
+
+    def test_only_effective_licenses_block(self, client):
+        # a pending other application does not block
+        self._submit(client, "pending-other", freq=(100, 110))
+        pid = self._submit(client, "P", freq=(100, 110))
+        r = self._search(client, pid, 0, 200)
+        assert r.json()["available_range_count"] == 1
+
+        # a revoked license does not block either
+        lic_id = self._submit(client, "L2", freq=(100, 110))
+        self._approve(client, lic_id, 0)
+        assert self._search(client, pid, 0, 200).json()[
+            "available_range_count"
+        ] == 2
+        client.post(f"/api/applications/{lic_id}/revoke", json={})
+        assert self._search(client, pid, 0, 200).json()[
+            "available_range_count"
+        ] == 1
+
+    def test_time_and_area_gates(self, client):
+        # adjacent half-open window -> never blocks
+        adjacent = self._submit(
+            client,
+            "adjacent",
+            freq=(100, 110),
+            start="2026-10-01T10:00:00Z",
+            end="2026-10-01T12:00:00Z",
+        )
+        self._approve(client, adjacent, 0)
+        pid = self._submit(client, "P", freq=(100, 110))
+        assert self._search(client, pid, 0, 200).json()[
+            "available_range_count"
+        ] == 1
+
+        # disjoint area -> never blocks
+        far = self._submit(client, "far", freq=(100, 110), circle=(100, 100, 1))
+        self._approve(client, far, 1)
+        assert self._search(client, pid, 0, 200).json()[
+            "available_range_count"
+        ] == 1
+
+    def test_uses_the_current_guard_band(self, client):
+        lic_id = self._submit(client, "L", freq=(100, 110))
+        self._approve(client, lic_id, 0)
+        pid = self._submit(client, "P", freq=(200, 200))
+
+        # under band 2: blocked (98, 112)
+        assert self._search(client, pid, 0, 200).json()["available_ranges"][
+            1
+        ]["low"] == 112.0
+        # tighten guard band to 1: blocked (99, 111)
+        ok = client.post(
+            "/api/config/guard-band",
+            json={"guard_band": 1.0, "expected_revision": 1},
+        )
+        assert ok.status_code == 200
+        d = self._search(client, pid, 0, 200).json()
+        assert d["guard_band"] == 1.0
+        assert d["current_revision"] == 2
+        assert d["available_ranges"][1]["low"] == 111.0
+
+    def test_query_does_not_mutate_state(self, client):
+        lic_id = self._submit(client, "L", freq=(100, 110))
+        self._approve(client, lic_id, 0)
+        pid = self._submit(client, "P", freq=(100, 110))
+        before = client.get("/api/revision/current").json()
+        for _ in range(3):
+            self._search(client, pid, 0, 200)
+        self._search(client, pid, 100, 105)  # empty result
+        after = client.get("/api/revision/current").json()
+        assert after["current_revision"] == before["current_revision"] == 1
+        assert after["effective_application_ids"] == [lic_id]
+        assert client.get(f"/api/applications/{pid}").json()["status"] == "pending"
+
+    def test_unknown_application_rejected(self, client):
+        r = self._search(client, 999, 0, 1)
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "not_found"
+
+    def test_non_pending_application_rejected(self, client):
+        lic_id = self._submit(client, "L")
+        self._approve(client, lic_id, 0)
+        r = self._search(client, lic_id, 0, 1)
+        assert r.status_code == 409
+        err = r.json()["error"]
+        assert err["code"] == "not_pending"
+        assert err["details"]["status"] == "approved"
+
+        client.post(f"/api/applications/{lic_id}/revoke", json={})
+        r = self._search(client, lic_id, 0, 1)
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "not_pending"
+
+    def test_invalid_window_rejected(self, client):
+        pid = self._submit(client, "P")
+
+        r = self._search(client, pid, 100, 50)
+        assert r.status_code == 422
+        err = r.json()["error"]
+        assert err["code"] == "validation_failed"
+        assert [d["code"] for d in err["details"]] == [
+            "frequency_low_above_high"
+        ]
+
+        # equal bounds are legal (closed singleton window)
+        assert self._search(client, pid, 100, 100).status_code == 200
+
+        for field, raw in (
+            ("low", '{"low": 1, "high": "x"}'),
+            ("missing", '{"low": 1}'),
+        ):
+            r = client.post(
+                self.PATH.format(id=pid),
+                content=raw,
+                headers={"Content-Type": "application/json"},
+            )
+            assert r.status_code == 422, field
+            assert r.json()["error"]["code"] == "validation_failed"
+
+        for raw in ("NaN", "Infinity", "-Infinity"):
+            r = client.post(
+                self.PATH.format(id=pid),
+                content='{"low": %s, "high": 5}' % raw,
+                headers={"Content-Type": "application/json"},
+            )
+            assert r.status_code == 422, raw
+            codes = [d["code"] for d in r.json()["error"]["details"]]
+            assert codes == ["value_not_finite"]
+
+        # A structurally valid but inverted window is rejected with 422 even
+        # for an unknown id: input validation precedes resource addressing
+        # (the same order the guard-band endpoints use).
+        assert client.post(
+            self.PATH.format(id=999),
+            json={"low": 100, "high": 50},
+        ).status_code == 422
+        # while a valid window against an unknown id is 404
+        assert client.post(
+            self.PATH.format(id=999),
+            json={"low": 0, "high": 1},
+        ).status_code == 404
+
+        # no revision consumed by any rejection
+        assert (
+            client.get("/api/revision/current").json()["current_revision"] == 0
+        )
+
+    def test_endpoints_agree_with_single_preview_at_every_boundary(
+        self, client
+    ):
+        # Effective licenses: overlapping time/place; mixed intersection and
+        # guard-band geometry.  Candidate width 7.
+        l1 = self._submit(client, "L1", freq=(100, 110))
+        l2 = self._submit(client, "L2", freq=(114, 120))
+        l3 = self._submit(client, "L3", freq=(300, 305))
+        self._approve(client, l1, 0)
+        self._approve(client, l2, 1)
+        self._approve(client, l3, 2)
+        pid = self._submit(client, "P", freq=(50, 57))  # width 7
+
+        def search():
+            return self._search(client, pid, 0, 400).json()["available_ranges"]
+
+        def preview_conflicts_at(x):
+            # A single preview of a fresh pending application carrying the
+            # same circle/time window and the retuned band [x, x+7].
+            probe = client.post(
+                "/api/applications",
+                json=body(name="probe", freq=(x, x + 7)),
+            ).json()["id"]
+            pv = client.post(f"/api/applications/{probe}/preview").json()
+            return pv["has_conflicts"]
+
+        def assert_ranges_consistent(ranges):
+            assert ranges
+            for rng in ranges:
+                assert preview_conflicts_at(rng["low"]) == (
+                    not rng["low_inclusive"]
+                )
+                assert preview_conflicts_at(rng["high"]) == (
+                    not rng["high_inclusive"]
+                )
+                if rng["low"] < rng["high"]:
+                    mid = (rng["low"] + rng["high"]) / 2.0
+                    assert preview_conflicts_at(mid) is False
+
+        # Under guard band 2 every blocker end is an open guard boundary, so
+        # all reported range endpoints are usable (inclusive).
+        ranges = search()
+        assert all(rng["low_inclusive"] and rng["high_inclusive"] for rng in ranges)
+        assert_ranges_consistent(ranges)
+
+        # Switch to guard band 0: closed-band touching now conflicts, so the
+        # search must expose exclusive (unusable) range endpoints - and the
+        # single preview must still agree at each of them.
+        ok = client.post(
+            "/api/config/guard-band",
+            json={"guard_band": 0.0, "expected_revision": 3},
+        )
+        assert ok.status_code == 200
+        ranges = search()
+        assert any(
+            not rng["low_inclusive"] or not rng["high_inclusive"]
+            for rng in ranges
+        )
+        assert_ranges_consistent(ranges)

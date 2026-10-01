@@ -74,6 +74,35 @@ class PairConflict:
     reason: str  # REASON_*
 
 
+@dataclass(frozen=True)
+class AvailableRange:
+    """One maximal run of interference-free candidate lower bounds.
+
+    A retuning keeps the application's original band width, coverage circle
+    and UTC window fixed and only moves its lower bound ``x``.  Every such
+    ``x`` inside this range keeps the retuned application clear of the
+    current effective set.  The inclusivity flags say whether each endpoint
+    itself is usable: closed-band touching blocks (endpoint included in the
+    blocked side), while a gap exactly equal to the guard band is allowed
+    (guarded boundaries therefore come back exclusive).
+    """
+
+    low: float
+    high: float
+    low_inclusive: bool
+    high_inclusive: bool
+
+
+@dataclass(frozen=True)
+class _BlockedInterval:
+    """Lower bounds blocked by one effective license, clipped to a window."""
+
+    low: float
+    high: float
+    low_inclusive: bool
+    high_inclusive: bool
+
+
 def circles_intersect(a: Circle, b: Circle) -> bool:
     """Planar disks intersect iff centre distance <= sum of radii.
 
@@ -250,3 +279,234 @@ def evaluate_group(
             within_group[candidates[j].application_id].append(backward[0])
 
     return against_effective, within_group
+
+
+# --------------------------------------------------------------------------- #
+# Retuning search: maximal interference-free ranges for the lower bound
+# --------------------------------------------------------------------------- #
+def lower_bound_blocks(
+    lower_bound: float,
+    width: float,
+    lic: License,
+    guard_band: float,
+) -> bool:
+    """Whether a candidate retuned to ``[lower_bound, lower_bound + width]``
+    conflicts with one license ``lic``.
+
+    Coverage circle and time window are those of the retuned application, so
+    callers only need to pass licenses whose circles and windows already
+    intersect them; this predicate is the frequency gate alone.  It goes
+    through :func:`frequency_conflicts`, the exact rule a single-application
+    preview uses at any concrete lower bound.
+    """
+    conflicts, _, _, _ = frequency_conflicts(
+        lower_bound, lower_bound + width, lic.freq_low, lic.freq_high, guard_band
+    )
+    return conflicts
+
+
+def _raw_blocked_interval(
+    lic: License, width: float, guard_band: float
+) -> tuple[float, float, bool, bool]:
+    """The set of lower bounds blocked by ``lic`` (before window clipping).
+
+    With the retuned band ``[x, x + width]`` against license band
+    ``[lic.freq_low, lic.freq_high]``:
+
+    * it intersects the closed band iff
+      ``lic.freq_low - width <= x <= lic.freq_high`` (touching included);
+    * otherwise a strict guard-band violation happens exactly on
+      ``lic.freq_low - width - guard_band < x < lic.freq_high + guard_band``.
+
+    Together the blocked set is the open interval
+    ``(lic.freq_low - width - guard_band, lic.freq_high + guard_band)``; the
+    endpoint flags are asked from :func:`lower_bound_blocks` so the result
+    agrees exactly with a single-application preview at the boundary values
+    (in particular both ends close when the guard band is zero).
+    """
+    raw_low = lic.freq_low - width - guard_band
+    raw_high = lic.freq_high + guard_band
+    low_inclusive = lower_bound_blocks(raw_low, width, lic, guard_band)
+    high_inclusive = lower_bound_blocks(raw_high, width, lic, guard_band)
+    return raw_low, raw_high, low_inclusive, high_inclusive
+
+
+def _clip_blocked(
+    raw_low: float,
+    raw_high: float,
+    raw_low_inclusive: bool,
+    raw_high_inclusive: bool,
+    window_low: float,
+    window_high: float,
+) -> _BlockedInterval | None:
+    """Clip one blocked interval into the candidate window.
+
+    Endpoints strictly inside the window after clipping are blocked; an
+    endpoint that lands exactly on a window boundary inherits the original
+    inclusivity (boundary points themselves are re-checked later).  A
+    degenerate point that is not blocked is dropped.
+    """
+    if raw_high < window_low or raw_low > window_high:
+        return None
+    if raw_low < window_low:
+        low = window_low
+        low_inclusive = raw_low_inclusive if raw_low == window_low else True
+    else:
+        low = raw_low
+        low_inclusive = raw_low_inclusive
+    if raw_high > window_high:
+        high = window_high
+        high_inclusive = raw_high_inclusive if raw_high == window_high else True
+    else:
+        high = raw_high
+        high_inclusive = raw_high_inclusive
+    if low == high and not (low_inclusive and high_inclusive):
+        return None
+    return _BlockedInterval(low, high, low_inclusive, high_inclusive)
+
+
+def _merge_blocked(
+    intervals: list[_BlockedInterval],
+) -> list[_BlockedInterval]:
+    """Merge overlapping blocked intervals, keeping blocked touching points.
+
+    Two intervals merge when they overlap in the real line.  Intervals that
+    only meet at one point merge as well whenever that point is blocked on
+    either side; two open ends merely touching stay separate so the free
+    singleton between them survives.
+    """
+    if not intervals:
+        return []
+    ordered = sorted(
+        intervals,
+        key=lambda iv: (iv.low, iv.high, not iv.low_inclusive),
+    )
+    merged: list[_BlockedInterval] = [ordered[0]]
+    for iv in ordered[1:]:
+        last = merged[-1]
+        if iv.low > last.high:
+            merged.append(iv)
+            continue
+        if iv.low == last.high and not (iv.low_inclusive or last.high_inclusive):
+            # Two open ends touch at a free point: the union is not connected
+            # at that point, so keep the intervals separate.
+            merged.append(iv)
+            continue
+        high = last.high
+        high_inclusive = last.high_inclusive
+        if iv.high > high:
+            high = iv.high
+            high_inclusive = iv.high_inclusive
+        elif iv.high == high:
+            high_inclusive = last.high_inclusive or iv.high_inclusive
+        merged[-1] = _BlockedInterval(
+            low=last.low,
+            high=high,
+            low_inclusive=last.low_inclusive,
+            high_inclusive=high_inclusive,
+        )
+    return merged
+
+
+def available_lower_bands(
+    candidate: License,
+    width: float,
+    window_low: float,
+    window_high: float,
+    effective: list[License],
+    guard_band: float,
+) -> list[AvailableRange]:
+    """Maximal interference-free ranges for the candidate's lower bound.
+
+    The candidate keeps its coverage circle, UTC window and band *width*
+    fixed; its closed band becomes ``[x, x + width]`` (``width == 0`` is the
+    single-frequency case).  Search only over ``window_low <= x <=
+    window_high``; the window is a closed interval.
+
+    Only effective licenses whose circles AND half-open windows intersect
+    the candidate can block it - the same gates as :func:`evaluate`.  For
+    every such license the blocked lower bounds form one interval; the
+    answer is the merged complement inside the search window.  Endpoint
+    inclusivity is decided with :func:`lower_bound_blocks`, i.e. by the same
+    frequency rule a single-application preview applies at that exact lower
+    bound, so both conclusions always agree.
+    """
+    if window_low > window_high:
+        raise ValueError("window_low must not exceed window_high")
+    if width < 0 or guard_band < 0:
+        raise ValueError("width and guard_band must be non-negative")
+
+    relevant = [
+        lic
+        for lic in effective
+        if half_open_intervals_intersect(
+            candidate.start_time,
+            candidate.end_time,
+            lic.start_time,
+            lic.end_time,
+        )
+        and circles_intersect(candidate.circle, lic.circle)
+    ]
+
+    clipped: list[_BlockedInterval] = []
+    for lic in relevant:
+        raw_low, raw_high, low_inc, high_inc = _raw_blocked_interval(
+            lic, width, guard_band
+        )
+        iv = _clip_blocked(
+            raw_low,
+            raw_high,
+            low_inc,
+            high_inc,
+            window_low,
+            window_high,
+        )
+        if iv is not None:
+            clipped.append(iv)
+
+    blocked = _merge_blocked(clipped)
+
+    def free_at(value: float) -> bool:
+        return not any(
+            lower_bound_blocks(value, width, lic, guard_band) for lic in relevant
+        )
+
+    # Walk the (window-clipped, sorted, merged) blocked intervals and emit
+    # the raw complementary gaps between them.
+    raw_gaps: list[list[float]] = []
+    cursor = window_low
+    for iv in blocked:
+        if cursor <= iv.low:
+            raw_gaps.append([cursor, iv.low])
+        cursor = iv.high
+    if cursor <= window_high:
+        raw_gaps.append([cursor, window_high])
+
+    # Neighbouring raw gaps can share one endpoint where two blocked
+    # intervals merely touch.  They are parts of one continuous free run
+    # exactly when the shared point itself is free (e.g. two guard-band
+    # boundaries one band width apart leave a gap equal to the guard band on
+    # both sides); an inclusive, blocked touching point must keep the gaps
+    # separate.  The decision uses the same frequency rule a single preview
+    # applies at that point, so the merged ranges stay maximal and agree with
+    # the preview at every boundary.
+    merged_gaps: list[list[float]] = []
+    for gap in raw_gaps:
+        low, high = gap
+        if merged_gaps:
+            prev = merged_gaps[-1]
+            if prev[1] == low and free_at(low):
+                prev[1] = high
+                continue
+        merged_gaps.append([low, high])
+
+    ranges: list[AvailableRange] = []
+    for low, high in merged_gaps:
+        if low == high:
+            if free_at(low):
+                ranges.append(AvailableRange(low, high, True, True))
+            continue
+        ranges.append(
+            AvailableRange(low, high, free_at(low), free_at(high))
+        )
+    return ranges

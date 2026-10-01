@@ -98,3 +98,33 @@ def validate_guard_band(value: float) -> list[dict[str, str]]:
             }
         )
     return errors
+
+
+def validate_frequency_window(low: float, high: float) -> list[dict[str, str]]:
+    """The retuning search window must be a finite, non-inverted closed interval."""
+    errors: list[dict[str, str]] = []
+    if not math.isfinite(low):
+        errors.append(
+            {
+                "field": "low",
+                "code": VALUE_NOT_FINITE,
+                "message": "low must be a finite number",
+            }
+        )
+    if not math.isfinite(high):
+        errors.append(
+            {
+                "field": "high",
+                "code": VALUE_NOT_FINITE,
+                "message": "high must be a finite number",
+            }
+        )
+    if math.isfinite(low) and math.isfinite(high) and low > high:
+        errors.append(
+            {
+                "field": "low",
+                "code": FREQUENCY_LOW_ABOVE_HIGH,
+                "message": "frequency low bound must not exceed high bound",
+            }
+        )
+    return errors
